@@ -1,5 +1,7 @@
-# Virtual_fence
-کتابخانه‌های لازم (PyTorch، OpenCV، CLIP، yolov5 و ...) را نصب می‌کند. opencv-contrib-python برای Selective Search لازم است.
+# Virtual_fence1     
+##این بخش اجرای کد اولیه هست  بدون اضافه کردن دیتاست کمکی و تصاویری که لیبل گذاری شده اند  و فقط یک اجرای برنامه تشحیص افراد و وارد شدن آنها به مستطیل  مشخص شده    
+##و شمارش آنهاست که در سه پلتفرم اجرا شده و خروجی قابل مشاهده است دیتاست کمکی آماده و لیبل گذاری و آموزش با دیتا ست جدید در Virtual_fence2  ارائه خواهد شد.  
+##کتابخانه‌های لازم (PyTorch، OpenCV، CLIP، yolov5 و ...) را نصب می‌کند. opencv-contrib-python برای Selective Search لازم است.
 # سلول 1 — نصب وابستگی‌ها (اجرا در Colab)
 !pip install --quiet torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 || true
 !pip install --quiet opencv-python-headless numpy scipy matplotlib scikit-image pycocotools pillow tqdm
