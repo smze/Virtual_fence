@@ -1,75 +1,430 @@
 # Virtual_fence
-Virtual Fence Project
-Overview
+کتابخانه‌های لازم (PyTorch، OpenCV، CLIP، yolov5 و ...) را نصب می‌کند. opencv-contrib-python برای Selective Search لازم است.
+# سلول 1 — نصب وابستگی‌ها (اجرا در Colab)
+!pip install --quiet torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu118 || true
+!pip install --quiet opencv-python-headless numpy scipy matplotlib scikit-image pycocotools pillow tqdm
+!pip install --quiet git+https://github.com/openai/CLIP.git
+!pip install --quiet opencv-contrib-python  # برای selective search و ximgproc
+# کلون yolov5 برای استفاده از مدل pretrained و ابزارها
+!git clone -q https://github.com/ultralytics/yolov5.git
+%cd yolov5
+!pip install -q -r requirements.txt
+%cd ..
 
-The Virtual Fence project is designed to detect and count people entering a predefined zone within a crowded street video. The system processes an input video, tracks people, and counts those who enter a specified rectangular zone. The output video shows detected people with bounding boxes, highlights the predefined zone, and provides a real-time counter of people entering the zone.
+!apt-get install unrar
+!unrar x vision_task.rar /content/
 
-This project compares the performance of three different detection methods: YOLOv5, VLM (Vision-Language Model), and Background Subtractor Detector (BG Subtractor).
+input_path = "/content/input.mp4"
+print("Video Path:", input_path)
 
-Features
+# سلول 3 — توابع یوتیلیتی برای رسم، ROI و ذخیره
+import cv2, numpy as np, time, csv
+from pathlib import Path
 
-Person Detection: Detects people in the video frames.
+def compute_center_roi(frame_shape, ratio_w=0.4, ratio_h=0.4):
+    h, w = frame_shape[:2]
+    rw = int(w * ratio_w); rh = int(h * ratio_h)
+    x1 = (w - rw) // 2; y1 = (h - rh) // 2
+    x2 = x1 + rw; y2 = y1 + rh
+    return (x1, y1, x2, y2)
 
-Tracking: Tracks individuals across frames in the video.
+def draw_roi(img, roi, color=(0,0,255), thickness=2):
+    x1,y1,x2,y2 = map(int, roi)
+    cv2.rectangle(img, (x1,y1), (x2,y2), color, thickness)
+    return img
 
-Zone Monitoring: Defines and monitors a rectangular zone for counting people entering it.
+def draw_tracks(img, tracks, color=(0,255,0), with_id=True):
+    for tr in tracks:
+        x1,y1,x2,y2,tid = map(int, tr)
+        cv2.rectangle(img, (x1,y1), (x2,y2), color, 2)
+        if with_id:
+            cv2.putText(img, f"ID:{int(tid)}", (x1, max(0,y1-6)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
+    return img
 
-Real-Time Counting: Displays the count of people entering the zone in real-time.
+def put_text(img, text, org=(10,30), color=(255,255,255)):
+    cv2.putText(img, text, org, cv2.FONT_HERSHEY_SIMPLEX, 1.0, color, 2)
+    return img
 
-Comparison of Methods: Compares the performance of YOLOv5, VLM, and BG Subtractor methods.
+def save_counts_csv(csv_path, frame_indices, counts):
+    p = Path(csv_path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    with open(csv_path, 'w', newline='') as f:
+        w = csv.writer(f)
+        w.writerow(['frame','count'])
+        for fr,c in zip(frame_indices, counts):
+            w.writerow([int(fr), int(c)])
+    print("Saved counts to:", csv_path)
 
-Frameworks and Methods Used
+# سلول 4 — tracker ساده IOU-based
+import numpy as np
+from scipy.optimize import linear_sum_assignment
 
-PyTorch: Used for training and deploying models.
+def iou(bb_test, bb_gt):
+    xx1 = max(bb_test[0], bb_gt[0]); yy1 = max(bb_test[1], bb_gt[1])
+    xx2 = min(bb_test[2], bb_gt[2]); yy2 = min(bb_test[3], bb_gt[3])
+    w = max(0., xx2-xx1); h = max(0., yy2-yy1)
+    inter = w*h
+    areaA = (bb_test[2]-bb_test[0])*(bb_test[3]-bb_test[1])
+    areaB = (bb_gt[2]-bb_gt[0])*(bb_gt[3]-bb_gt[1])
+    return inter / (areaA + areaB - inter + 1e-6)
 
-YOLOv5: A state-of-the-art object detection model that detects people in each frame.
+class Track:
+    def __init__(self, bbox, tid):
+        self.bbox = bbox
+        self.id = tid
+        self.missed = 0
 
-VLM (Vision-Language Model): Used for enhanced detection capabilities, incorporating both visual and linguistic features.
+class SimpleIOUTracker:
+    def __init__(self, max_age=30, iou_threshold=0.3):
+        self.max_age = max_age
+        self.iou_threshold = iou_threshold
+        self.tracks = []
+        self._next_id = 1
 
-BG Subtractor Detector: A background subtraction technique for detecting moving objects (people) in the scene.
+    def update(self, detections):
+        dets = [d[:4] for d in detections] if len(detections)>0 else []
+        N = len(self.tracks); M = len(dets)
+        matched, unmatched_t, unmatched_d = [], list(range(N)), list(range(M))
+        if N>0 and M>0:
+            iou_mat = np.zeros((N,M))
+            for t,tr in enumerate(self.tracks):
+                for d,db in enumerate(dets):
+                    iou_mat[t,d] = iou(tr.bbox, db)
+            row_ind, col_ind = linear_sum_assignment(-iou_mat)
+            for r,c in zip(row_ind, col_ind):
+                if iou_mat[r,c] >= self.iou_threshold:
+                    matched.append((r,c))
+                    unmatched_t.remove(r); unmatched_d.remove(c)
+        for r,c in matched:
+            self.tracks[r].bbox = dets[c]; self.tracks[r].missed = 0
+        for idx in unmatched_d:
+            self.tracks.append(Track(dets[idx], self._next_id)); self._next_id += 1
+        for idx in unmatched_t:
+            self.tracks[idx].missed += 1
+        self.tracks = [t for t in self.tracks if t.missed <= self.max_age]
+        out = []
+        for t in self.tracks:
+            out.append([t.bbox[0], t.bbox[1], t.bbox[2], t.bbox[3], t.id])
+        return out
 
-These methods are compared to determine which one performs best for detecting and counting people entering the zone.
+# سلول 5 — YOLO detector (yolov5 via torch.hub)
+import torch
+import numpy as np
 
-Datasets
+def load_yolo(device='cpu', conf_thres=0.35):
+    model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True).to(device)
+    model.conf = conf_thres
+    return model
 
-In the next step, the project will utilize the CrowdHuman dataset along with additional data obtained from Pexels images as a supplementary dataset for fine-tuning the model. These datasets are available and will be used to improve the system's performance.
+def yolo_detect(model, frame, device='cpu', imgsz=640):
+    img_rgb = frame[:, :, ::-1]  # BGR -> RGB
+    results = model(img_rgb, size=imgsz)
+    preds = results.xyxy[0].cpu().numpy()
+    out = []
+    for x1,y1,x2,y2,conf,cls in preds:
+        if int(cls) == 0:
+            out.append([float(x1), float(y1), float(x2), float(y2), float(conf)])
+    return out
 
-Installation
-Prerequisites
+# سلول 6 — VLM (CLIP) + Selective Search proposals
+import clip, torch, cv2
+device = "cuda" if torch.cuda.is_available() else "cpu"
+clip_model, preprocess = clip.load("ViT-B/32", device=device)
 
-Python 3.x
+def get_selective_search_proposals(img_bgr, max_proposals=800):
+    ss = cv2.ximgproc.segmentation.createSelectiveSearchSegmentation()
+    ss.setBaseImage(img_bgr)
+    ss.switchToSelectiveSearchFast()
+    rects = ss.process()
+    proposals = []
+    for (x,y,w,h) in rects[:max_proposals]:
+        if w < 20 or h < 20: continue
+        proposals.append([x, y, x+w, y+h])
+    return proposals
 
-OpenCV
+text_templates = ["a photo of a person", "a person walking", "a pedestrian"]
+with torch.no_grad():
+    text_tokens = clip.tokenize(text_templates).to(device)
+    text_feats = clip_model.encode_text(text_tokens)
+    text_feats = text_feats / text_feats.norm(dim=-1, keepdim=True)
+    text_avg = text_feats.mean(dim=0, keepdim=True)
 
-PyTorch
+def vlm_detect(frame, sim_threshold=0.25, max_proposals=500):
+    proposals = get_selective_search_proposals(frame, max_proposals=max_proposals)
+    out = []
+    for (x1,y1,x2,y2) in proposals:
+        crop = frame[int(y1):int(y2), int(x1):int(x2)]
+        if crop.size == 0: continue
+        img_rgb = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+        img_resized = cv2.resize(img_rgb, (224,224))
+        img_input = preprocess(img_resized).unsqueeze(0).to(device)
+        with torch.no_grad():
+            img_feat = clip_model.encode_image(img_input)
+            img_feat = img_feat / img_feat.norm(dim=-1, keepdim=True)
+            sim = (img_feat @ text_avg.T).item()
+        if sim > sim_threshold:
+            out.append([float(x1), float(y1), float(x2), float(y2), float(sim)])
+    return out
 
-YOLOv5 dependencies
+# سلول 7 — BG Subtractor detector (MOG2)
+import cv2, numpy as np
 
-NumPy
+class BGSubDetector:
+    def __init__(self, history=50, varThreshold=16, detectShadows=True, min_area=500):
+        self.backSub = cv2.createBackgroundSubtractorMOG2(history=history, varThreshold=varThreshold, detectShadows=detectShadows)
+        self.min_area = min_area
 
+    def detect(self, frame):
+        fgmask = self.backSub.apply(frame)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3,3))
+        fgmask = cv2.morphologyEx(fgmask, cv2.MORPH_OPEN, kernel, iterations=1)
+        contours, _ = cv2.findContours(fgmask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        out = []
+        for c in contours:
+            if cv2.contourArea(c) < self.min_area: continue
+            x,y,w,h = cv2.boundingRect(c)
+            out.append([float(x), float(y), float(x+w), float(y+h), 1.0])
+        return out
 
-Dataset Preparation
+وقتی centroid هر track وارد ROI مرکزی شود و id جدید باشد، شمارش را یک واحد افزایش می‌دهد.
+# سلول 8 — RegionCounter
+class RegionCounter:
+    def __init__(self, roi):
+        self.roi = roi
+        self.counted_ids = set()
+        self.count = 0
 
-The additional dataset used for fine-tuning consists of images obtained from Pexels. These images need to be labeled before they can be used for training.
+    def _centroid(self, bbox):
+        x1,y1,x2,y2 = bbox
+        return ((x1+x2)/2.0, (y1+y2)/2.0)
 
-Labeling the Pexels Images:
+    def _inside(self, cx, cy):
+        x1,y1,x2,y2 = self.roi
+        return (cx >= x1 and cx <= x2 and cy >= y1 and cy <= y2)
 
-First, you need to label the images using labeling tools like LabelImg. This involves manually drawing bounding boxes around people or objects of interest and assigning labels.
+    def update(self, tracks):
+        for tr in tracks:
+            x1,y1,x2,y2,tid = tr
+            cx,cy = self._centroid((x1,y1,x2,y2))
+            if self._inside(cx,cy) and (tid not in self.counted_ids):
+                self.counted_ids.add(tid)
+                self.count += 1
 
-Splitting the Video:
+تابع عمومی اجرای pipeline (detect → track → count → write MP4)
+# سلول 9 — run_pipeline function
+import cv2, time
+from tqdm import tqdm
 
-After labeling the Pexels images, the input video (e.g., input.mp4) should be split into individual frames.
+def run_pipeline(input_video_path, output_video_path, method='yolo', device='cpu', roi_ratio=(0.4,0.4),
+                 yolo_conf=0.35, max_frames=None, vlm_max_props=500):
+    cap = cv2.VideoCapture(input_video_path)
+    assert cap.isOpened(), "Cannot open input video. Check input path."
 
-Labeling the Frames:
+    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)); h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 25.0
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_video_path, fourcc, fps, (w,h))
 
-Once the video is split into frames, you will need to label these frames using LabelImg as well. This step helps in creating the necessary annotations for each frame.
+    roi = compute_center_roi((h,w,3), ratio_w=roi_ratio[0], ratio_h=roi_ratio[1])
+    counter = RegionCounter(roi)
+    tracker = SimpleIOUTracker(max_age=30, iou_threshold=0.3)
 
-Converting to YOLO Format:
+    if method == 'yolo':
+        ymodel = load_yolo(device=device, conf_thres=yolo_conf)
+        detector_func = lambda frame: yolo_detect(ymodel, frame, device=device)
+    elif method == 'vlm':
+        detector_func = lambda frame: vlm_detect(frame, max_proposals=vlm_max_props)
+    elif method == 'bgsub':
+        bgdet = BGSubDetector()
+        detector_func = lambda frame: bgdet.detect(frame)
+    else:
+        raise ValueError("Unknown method")
 
-After labeling, the annotations in XML format should be converted to the YOLO format. This is crucial for training the model with YOLOv5, as YOLO requires annotations in its own specific format.
+    frame_idx = 0
+    times = []
+    frame_indices = []
+    counts_over_time = []
 
-Note: This part of the dataset preparation will be completed in the next step.
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    pbar = tqdm(total= total_frames if max_frames is None else max_frames)
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        if max_frames and frame_idx >= max_frames:
+            break
 
-By following these steps, you can prepare the dataset for fine-tuning and ensure it is ready for model training.
+        t0 = time.time()
+        dets = detector_func(frame)
+        tracks = tracker.update(dets)
+        counter.update(tracks)
+        t1 = time.time()
+        times.append(t1-t0)
+
+        img = frame.copy()
+        img = draw_roi(img, roi)
+        img = draw_tracks(img, tracks, with_id=True)
+        img = put_text(img, f"Count: {counter.count}", (10,30))
+        out.write(img)
+
+        frame_indices.append(frame_idx)
+        counts_over_time.append(counter.count)
+
+        frame_idx += 1
+        pbar.update(1)
+    pbar.close()
+    cap.release(); out.release()
+    avg_time = sum(times)/len(times) if len(times)>0 else 0.0
+    fps_proc = 1.0/avg_time if avg_time>0 else 0.0
+    print(f"Method={method} done. Avg inference time per frame: {avg_time:.3f}s, Approx FPS: {fps_proc:.2f}, Total count: {counter.count}")
+    return {
+        "output_video": output_video_path,
+        "avg_time_per_frame": avg_time,
+        "approx_fps": fps_proc,
+        "total_count": counter.count,
+        "frame_indices": frame_indices,
+        "counts_over_time": counts_over_time
+    }
+
+import torch
+import cv2
+import os
+import json
+
+# ------------------------
+# تنظیمات قابل تغییر
+# ------------------------
+input_path = "/content/input.mp4"
+device = 'cuda' if torch.cuda.is_available() else 'cpu'
+roi_ratio = (0.4, 0.4)   # درصد ROI وسط تصویر
+yolo_conf = 0.35
+max_frames = None         #اگر بخواهیم تعداد فریم محدود شود، عدد میگذاریم
+vlm_max_props = 400       # برای VLM (placeholder)
+
+# ------------------------
+# تعریف تابع YOLOv5
+# ------------------------
+def run_pipeline_yolo(input_vid, output_path, device='cpu', roi_ratio=(0.4,0.4), yolo_conf=0.35, max_frames=None):
+    if not isinstance(input_vid, str) or not os.path.exists(input_vid):
+        raise TypeError(f"input_vid باید مسیر ویدیو باشد (string). دریافت شد: {type(input_vid)}")
+
+    model = torch.hub.load('ultralytics/yolov5', 'yolov5s', pretrained=True)
+    model.to(device)
+    model.conf = yolo_conf
+
+    cap = cv2.VideoCapture(input_vid)
+    if not cap.isOpened():
+        raise ValueError(f"ویدیو قابل باز شدن نیست: {input_vid}")
+
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+    frame_count = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        # اعمال ROI
+        roi_w, roi_h = int(width*roi_ratio[0]), int(height*roi_ratio[1])
+        x1, y1 = (width - roi_w)//2, (height - roi_h)//2
+        roi_frame = frame[y1:y1+roi_h, x1:x1+roi_w]
+
+        # YOLO inference روی ROI
+        results = model(roi_frame)
+        labels, cords = results.xyxyn[0][:, -1], results.xyxyn[0][:, :-1]
+
+        for i, (x1n, y1n, x2n, y2n, conf) in enumerate(cords):
+            x1b = int(x1n*roi_w) + x1
+            y1b = int(y1n*roi_h) + y1
+            x2b = int(x2n*roi_w) + x1
+            y2b = int(y2n*roi_h) + y1
+            label = int(labels[i])
+            cv2.rectangle(frame, (x1b, y1b), (x2b, y2b), (0,255,0), 2)
+            cv2.putText(frame, f'{model.names[label]} {conf:.2f}', (x1b, y1b-5),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2)
+
+        out.write(frame)
+        frame_count += 1
+        if max_frames is not None and frame_count >= max_frames:
+            break
+
+    cap.release()
+    out.release()
+    print(f"✅ YOLOv5 finished on {frame_count} frames. Output: {output_path}")
+    return output_path
+
+# ------------------------
+# تعریف تابع VLM (placeholder)
+# ------------------------
+def run_pipeline_vlm(input_vid, output_path, max_frames=None, vlm_max_props=400):
+    print("⚡ Running VLM (placeholder)...")
+    cap = cv2.VideoCapture(input_vid)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+    frame_count = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        out.write(frame)  # بدون تغییر (placeholder)
+        frame_count += 1
+        if max_frames is not None and frame_count >= max_frames:
+            break
+    cap.release()
+    out.release()
+    print(f"✅ VLM placeholder finished on {frame_count} frames. Output: {output_path}")
+    return output_path
+
+# ------------------------
+# Background Subtraction
+# ------------------------
+def run_pipeline_bgsub(input_vid, output_path, max_frames=None):
+    print("⚡ Running Background Subtraction...")
+    cap = cv2.VideoCapture(input_vid)
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+    out = cv2.VideoWriter(output_path, fourcc, fps, (width, height))
+
+    fgbg = cv2.createBackgroundSubtractorMOG2()
+    frame_count = 0
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+        fgmask = fgbg.apply(frame)
+        fgmask_color = cv2.cvtColor(fgmask, cv2.COLOR_GRAY2BGR)
+        out.write(fgmask_color)
+        frame_count += 1
+        if max_frames is not None and frame_count >= max_frames:
+            break
+    cap.release()
+    out.release()
+    print(f"✅ Background Subtraction finished on {frame_count} frames. Output: {output_path}")
+    return output_path
+
+# ------------------------
+# اجرای Pipeline کامل
+# ------------------------
+results = {}
+results['yolo'] = run_pipeline_yolo(input_path, "/content/output_yolo.mp4", device=device, roi_ratio=roi_ratio, yolo_conf=yolo_conf, max_frames=max_frames)
+results['vlm']  = run_pipeline_vlm(input_path, "/content/output_vlm.mp4", max_frames=max_frames, vlm_max_props=vlm_max_props)
+results['bgsub'] = run_pipeline_bgsub(input_path, "/content/output_bgsub.mp4", max_frames=max_frames)
+
+# ذخیره خلاصه نتایج
+with open("/content/summary_results.json","w") as f:
+    json.dump(results, f, indent=2)
+
+print("✅ All pipelines finished. Summary saved to /content/summary_results.json")
 
 
